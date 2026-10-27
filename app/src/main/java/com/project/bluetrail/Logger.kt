@@ -43,9 +43,10 @@ class Logger(private val context: Context) {
         val chargeCounter = getChargeCounterUah()
 
         // Ensure commas and new lines don't disrupt CSV format
+        val sanitisedDevice = device.replace(",", ";").replace("\n", " ")
         val sanitisedDetails = details.replace(",", ";").replace("\n", " ")
 
-        val logEntry = "$timestamp,$event,$device,$sanitisedDetails,$screenState,$batteryPct,$chargeCounter\n"
+        val logEntry = "$timestamp,$event,$sanitisedDevice,$sanitisedDetails,$screenState,$batteryPct,$chargeCounter\n"
 
         FileWriter(logFile, true).use { writer ->
             writer.append(logEntry)

@@ -1,6 +1,7 @@
 package com.project.bluetrail
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -37,14 +38,39 @@ class MainActivity : ComponentActivity() {
                     MainScreen(
                         logger = logger,
                         btHelper = btHelper,
+                        onStartService = { startTrackingService() },
+                        onStopService = { stopTrackingService() },
+                        onMarkWithLabel = { tag -> sendTaggedMarkIntent(tag) },
                         onExportClick = {
                             val intent = logger.getExportIntent()
-                            startActivity(android.content.Intent.createChooser(intent, "Export BlueTrail Log"))
+                            startActivity(Intent.createChooser(intent, "Export BlueTrail Log"))
                         }
                     )
                 }
             }
         }
+    }
+
+    private fun startTrackingService() {
+        val intent = Intent(this, TrackingService::class.java).apply {
+            action = TrackingService.ACTION_START_SERVICE
+        }
+        ContextCompat.startForegroundService(this, intent)
+    }
+
+    private fun stopTrackingService() {
+        val intent = Intent(this, TrackingService::class.java).apply {
+            action = TrackingService.ACTION_STOP_SERVICE
+        }
+        startService(intent)
+    }
+
+    private fun sendTaggedMarkIntent(label: String) {
+        val intent = Intent(this, TrackingService::class.java).apply {
+            action = TrackingService.ACTION_TAG_MARK
+            putExtra(TrackingService.EXTRA_MANUAL_LABEL, label)
+        }
+        startService(intent)
     }
 }
 
@@ -52,12 +78,15 @@ class MainActivity : ComponentActivity() {
 fun MainScreen(
     logger: Logger,
     btHelper: BluetoothHelper,
+    onStartService: () -> Unit,
+    onStopService: () -> Unit,
+    onMarkWithLabel: (String) -> Unit,
     onExportClick: () -> Unit
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
     var logContent by remember { mutableStateOf(logger.readLog()) }
+    var testTagInput by remember { mutableStateOf("T03 case-closed") }
 
-    // Logic to query paired devices and append each into the logger
     fun fetchAndLogDevices() {
         if (!btHelper.isBluetoothEnabled()) {
             Toast.makeText(context, "Please turn on Bluetooth first", Toast.LENGTH_SHORT).show()
@@ -76,34 +105,35 @@ fun MainScreen(
         logContent = logger.readLog()
     }
 
-    // Permission launcher contract for runtime permission prompt
-    val permissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestPermission()
-    ) { isGranted ->
-        if (isGranted) {
-            fetchAndLogDevices()
+    val permissionsLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) { perms ->
+        val btGranted = perms[Manifest.permission.BLUETOOTH_CONNECT] ?: true
+        val notifGranted = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU || perms[Manifest.permission.POST_NOTIFICATIONS] ?: false
+
+        if (btGranted && notifGranted) {
+            onStartService()
+            Toast.makeText(context, "Monitoring started", Toast.LENGTH_SHORT).show()
         } else {
-            Toast.makeText(context, "Bluetooth permission required to list devices", Toast.LENGTH_LONG).show()
-            logger.log(event = "PERMISSION_DENIED", details = "BLUETOOTH_CONNECT was rejected")
-            logContent = logger.readLog()
+            Toast.makeText(context, "Bluetooth and Notification permissions required", Toast.LENGTH_LONG).show()
         }
     }
 
-    fun onScanPairedClick() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            val hasPermission = ContextCompat.checkSelfPermission(
-                context,
-                Manifest.permission.BLUETOOTH_CONNECT
-            ) == PackageManager.PERMISSION_GRANTED
-
-            if (hasPermission) {
-                fetchAndLogDevices()
-            } else {
-                permissionLauncher.launch(Manifest.permission.BLUETOOTH_CONNECT)
+    fun requestPermissionsAndStart() {
+        val needed = mutableListOf<String>()
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+            needed.add(Manifest.permission.BLUETOOTH_CONNECT)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                needed.add(Manifest.permission.POST_NOTIFICATIONS)
             }
+        }
+
+        if (needed.isEmpty()) {
+            onStartService()
         } else {
-            // Android 11 and lower do not require BLUETOOTH_CONNECT
-            fetchAndLogDevices()
+            permissionsLauncher.launch(needed.toTypedArray())
         }
     }
 
@@ -113,18 +143,34 @@ fun MainScreen(
             .padding(16.dp)
     ) {
         Text(
-            text = "BlueTrail - Test App",
+            text = "BlueTrail - Test App (CP3)",
             style = MaterialTheme.typography.titleLarge
         )
 
-        Spacer(modifier = Modifier.height(12.dp))
+        Spacer(modifier = Modifier.height(10.dp))
 
-        // New CP2 Button: Scan Paired Devices
-        Button(
-            onClick = { onScanPairedClick() },
-            modifier = Modifier.fillMaxWidth()
+        // Service Controls
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Text("List Paired Devices")
+            Button(
+                onClick = { requestPermissionsAndStart() },
+                modifier = Modifier.weight(1f)
+            ) {
+                Text("Start Monitor")
+            }
+
+            Button(
+                onClick = {
+                    onStopService()
+                    logContent = logger.readLog()
+                },
+                modifier = Modifier.weight(1f),
+                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+            ) {
+                Text("Stop Monitor")
+            }
         }
 
         Spacer(modifier = Modifier.height(8.dp))
@@ -134,13 +180,48 @@ fun MainScreen(
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Button(
+                onClick = { fetchAndLogDevices() },
+                modifier = Modifier.weight(1f)
+            ) {
+                Text("List Paired")
+            }
+
+            Button(
                 onClick = {
-                    logger.log(event = "MANUAL_TEST", details = "User pressed test button")
+                    btHelper.checkAndLogConnectedDevices(logger, trigger = "MANUAL_CHECK")
                     logContent = logger.readLog()
                 },
                 modifier = Modifier.weight(1f)
             ) {
-                Text("Log Event")
+                Text("Check Connected")
+            }
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        // Input field for specific scenarios
+        OutlinedTextField(
+            value = testTagInput,
+            onValueChange = { testTagInput = it },
+            label = { Text("Scenario Tag (e.g. T03 case-closed)") },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true
+        )
+
+        Spacer(modifier = Modifier.height(6.dp))
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Button(
+                onClick = {
+                    onMarkWithLabel(testTagInput)
+                    logContent = logger.readLog()
+                },
+                modifier = Modifier.weight(1f)
+            ) {
+                Text("Mark ($testTagInput)")
             }
 
             Button(
@@ -175,14 +256,14 @@ fun MainScreen(
             }
         }
 
-        Spacer(modifier = Modifier.height(16.dp))
+        Spacer(modifier = Modifier.height(12.dp))
 
         Text(
             text = "Log Output (bluetrail_log.csv):",
             style = MaterialTheme.typography.labelLarge
         )
 
-        Spacer(modifier = Modifier.height(8.dp))
+        Spacer(modifier = Modifier.height(6.dp))
 
         Surface(
             modifier = Modifier
@@ -197,7 +278,7 @@ fun MainScreen(
                     .padding(8.dp)
                     .verticalScroll(rememberScrollState()),
                 fontSize = 11.sp,
-                lineHeight = 15.sp
+                lineHeight = 14.sp
             )
         }
     }
