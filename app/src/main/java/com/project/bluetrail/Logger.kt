@@ -14,69 +14,81 @@ import java.util.Locale
 import java.util.TimeZone
 
 class Logger(private val context: Context) {
+
+    companion object {
+        // Shared static mutex across all instances in MainActivity and TrackingService
+        // Important so that only one thread can write to the file at a time
+        private val fileLock = Any()
+    }
+
     private val logFileName = "bluetrail_log.csv"
     private val logFile: File = File(context.filesDir, logFileName)
 
     init {
-        // Create file if it doesn't exist
-        if (!logFile.exists()){
-            writeHeader()
+        synchronized(fileLock) {
+            if (!logFile.exists()) {
+                writeHeader()
+            }
         }
     }
 
-    /**
-     * Appends the header to the CSV logger file
-     */
     private fun writeHeader() {
-        val header = "timestamp_iso,event,device,details,screen_state,battery_pct,charge_counter_uah\n"
+        val header = "timestamp_iso,event,device,details,screen_state,battery_pct,charge_counter_uah,latitude,longitude,accuracy_m,fix_latency_ms,last_known_age_s\n"
         logFile.writeText(header)
     }
 
-    /**
-     * Appends a single row to the CSV file with event information
-     */
-    @Synchronized
-    fun log(event: String, device: String = "N/A", details: String = "") {
+    fun log(
+        event: String,
+        device: String = "N/A",
+        details: String = "",
+        latitude: Double? = null,
+        longitude: Double? = null,
+        accuracyM: Float? = null,
+        fixLatencyMs: Long? = null,
+        lastKnownAgeS: Long? = null
+    ) {
         val timestamp = getIsoTimestamp()
         val screenState = getScreenState()
         val batteryPct = getBatteryPercentage()
         val chargeCounter = getChargeCounterUah()
 
-        // Ensure commas and new lines don't disrupt CSV format
         val sanitisedDevice = device.replace(",", ";").replace("\n", " ")
         val sanitisedDetails = details.replace(",", ";").replace("\n", " ")
 
-        val logEntry = "$timestamp,$event,$sanitisedDevice,$sanitisedDetails,$screenState,$batteryPct,$chargeCounter\n"
+        val latStr = latitude?.let { String.format(Locale.US, "%.6f", it) } ?: "N/A"
+        val lngStr = longitude?.let { String.format(Locale.US, "%.6f", it) } ?: "N/A"
+        val accStr = accuracyM?.let { String.format(Locale.US, "%.1f", it) } ?: "N/A"
+        val latMsStr = fixLatencyMs?.toString() ?: "N/A"
+        val ageStr = lastKnownAgeS?.toString() ?: "N/A"
 
-        FileWriter(logFile, true).use { writer ->
-            writer.append(logEntry)
+        val logEntry = "$timestamp,$event,$sanitisedDevice,$sanitisedDetails,$screenState,$batteryPct,$chargeCounter,$latStr,$lngStr,$accStr,$latMsStr,$ageStr\n"
+
+        synchronized(fileLock) {
+            FileWriter(logFile, true).use { writer ->
+                writer.append(logEntry)
+            }
         }
     }
 
-    /**
-     * Reads the entire log file as text so we can display it on the screen
-     */
     fun readLog(): String {
-        return if (logFile.exists()) {
-            logFile.readText()
-        } else {
-            "Log file is empty."
+        synchronized(fileLock) {
+            return if (logFile.exists()) {
+                logFile.readText()
+            } else {
+                "Log file is empty."
+            }
         }
     }
 
-    /**
-     * Deletes the log file and resets header
-     */
     fun clearLog() {
-        if (logFile.exists()) {
-            logFile.delete()
+        synchronized(fileLock) {
+            if (logFile.exists()) {
+                logFile.delete()
+            }
+            writeHeader()
         }
-        writeHeader()
     }
 
-    /**
-     * Creates an Intent to export the CSV file to another place
-     */
     fun getExportIntent(): Intent {
         val uri = FileProvider.getUriForFile(
             context,
@@ -92,8 +104,6 @@ class Logger(private val context: Context) {
         }
     }
 
-    // Private helpers for system diagnostics
-
     private fun getIsoTimestamp(): String {
         val sdf = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
         sdf.timeZone = TimeZone.getTimeZone("UTC")
@@ -106,7 +116,6 @@ class Logger(private val context: Context) {
     }
 
     private fun getBatteryPercentage(): Int {
-        // Ask for the last battery intent broadcasted by the OS
         val batteryIntent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
         val level = batteryIntent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
         val scale = batteryIntent?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1

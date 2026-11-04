@@ -13,15 +13,13 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.RemoteInput
-import android.Manifest
-import android.content.pm.PackageManager
-import androidx.core.content.ContextCompat
 
 class TrackingService : Service() {
 
     private val logger by lazy { Logger(applicationContext) }
     private val btHelper by lazy { BluetoothHelper(applicationContext) }
-    private val notiHelper by lazy { NotificationHelper(applicationContext) }
+    private val notifHelper by lazy { NotificationHelper(applicationContext) }
+    private val locationHelper by lazy { LocationHelper(applicationContext) }
 
     private var markCounter = 0
 
@@ -48,27 +46,26 @@ class TrackingService : Service() {
             val deviceAddress = device?.address ?: "No_MAC"
 
             when (action) {
-                // Handles Bluetooth device connecting
                 BluetoothDevice.ACTION_ACL_CONNECTED -> {
                     logger.log(
                         event = "BT_ACL_CONNECTED",
                         device = deviceName,
                         details = "MAC: $deviceAddress"
                     )
-                    notiHelper.update("Connected: $deviceName")
+                    notifHelper.update("Connected: $deviceName")
                 }
 
-                // Handles Bluetooth device disconnecting
                 BluetoothDevice.ACTION_ACL_DISCONNECTED -> {
                     logger.log(
                         event = "BT_ACL_DISCONNECTED",
                         device = deviceName,
                         details = "MAC: $deviceAddress"
                     )
-                    notiHelper.update("Disconnected: $deviceName")
+                    notifHelper.update("Disconnected: $deviceName (Locating...)")
+
+                    triggerLocationFix(triggerSource = "BT_DISCONNECT", targetDevice = deviceName)
                 }
 
-                // Handling Bluetooth being turned on or off (bluetooth adapter state has changed)
                 BluetoothAdapter.ACTION_STATE_CHANGED -> {
                     val state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
                     val prevState = intent.getIntExtra(BluetoothAdapter.EXTRA_PREVIOUS_STATE, BluetoothAdapter.ERROR)
@@ -94,13 +91,11 @@ class TrackingService : Service() {
                         details = "State: $prevStr -> $stateStr"
                     )
 
-                    // Re-check connected devices when Bluetooth turns back on
                     if (state == BluetoothAdapter.STATE_ON) {
                         btHelper.checkAndLogConnectedDevices(logger, trigger = "BT_TURNED_ON")
                     }
                 }
 
-                // Handles Bluetooth device starting or stopping audio
                 BluetoothA2dp.ACTION_PLAYING_STATE_CHANGED -> {
                     val state = intent.getIntExtra(BluetoothA2dp.EXTRA_STATE, -1)
                     val stateStr = when (state) {
@@ -126,19 +121,8 @@ class TrackingService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START_SERVICE -> {
-                // Android 14+ will crash if startForeground is called without BLUETOOTH_CONNECT granted
-                if (!hasBluetoothConnectPermission()) {
-                    logger.log(
-                        event = "SERVICE_ERROR",
-                        details = "Cannot start connectedDevice FGS: BLUETOOTH_CONNECT not granted"
-                    )
-                    stopSelf()
-                    return START_NOT_STICKY
-                }
-
                 startInForeground("Monitoring active")
                 logger.log(event = "SERVICE_START", details = "TrackingService started in foreground")
-                // Perform startup check for connected devices across A2DP, HEADSET, and GATT
                 btHelper.checkAndLogConnectedDevices(logger, trigger = "SERVICE_STARTUP")
             }
 
@@ -147,9 +131,12 @@ class TrackingService : Service() {
                 logger.log(
                     event = "USER_MARK",
                     device = "QuickMark",
-                    details = "Mark #$markCounter"
+                    details = "Mark #$markCounter (In-Pocket Tap)"
                 )
-                notiHelper.update("Monitoring active (Marks: $markCounter)")
+                notifHelper.update("Monitoring active (Marks: $markCounter)")
+
+                // Take location fix on every quick mark
+                triggerLocationFix(triggerSource = "QUICK_MARK #$markCounter", targetDevice = "QuickMark")
             }
 
             ACTION_TAG_MARK -> {
@@ -164,7 +151,9 @@ class TrackingService : Service() {
                     device = "TaggedMark",
                     details = "Mark #$markCounter: $typedTag"
                 )
-                notiHelper.update("Marked: $typedTag (Total: $markCounter)")
+                notifHelper.update("Marked: $typedTag (Total: $markCounter)")
+                // CP4: Take location fix on every tagged mark
+                triggerLocationFix(triggerSource = "TAG_MARK #$markCounter ($typedTag)", targetDevice = "TaggedMark")
             }
 
             ACTION_STOP_SERVICE -> {
@@ -178,29 +167,56 @@ class TrackingService : Service() {
         return START_STICKY
     }
 
+    private fun triggerLocationFix(triggerSource: String, targetDevice: String) {
+        locationHelper.captureFreshFix { result ->
+            if (result.latitude != null && result.longitude != null) {
+                logger.log(
+                    event = "LOCATION_FIX",
+                    device = targetDevice,
+                    details = "Trigger: $triggerSource; Mode: ${result.modeUsed}; Latency: ${result.fixLatencyMs}ms; Acc: ${result.accuracyMeters}m; LastKnownAge: ${result.lastKnownAgeSeconds}s",
+                    latitude = result.latitude,
+                    longitude = result.longitude,
+                    accuracyM = result.accuracyMeters,
+                    fixLatencyMs = result.fixLatencyMs,
+                    lastKnownAgeS = result.lastKnownAgeSeconds
+                )
+            } else {
+                logger.log(
+                    event = "LOCATION_FAILED",
+                    device = targetDevice,
+                    details = "Trigger: $triggerSource; Mode: ${result.modeUsed}; Reason: ${result.failureReason ?: "Unknown error"}; Latency: ${result.fixLatencyMs}ms; LastKnownAge: ${result.lastKnownAgeSeconds}s",
+                    fixLatencyMs = result.fixLatencyMs,
+                    lastKnownAgeS = result.lastKnownAgeSeconds
+                )
+            }
+        }
+    }
+
     private fun startInForeground(initialText: String) {
-        val notification = notiHelper.buildNotification(initialText)
+        val notification = notifHelper.buildNotification(initialText)
+
+        // Only attach location if permission is granted
+        var fgsTypes = ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            if (locationHelper.hasLocationPermission()) {
+                fgsTypes = fgsTypes or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+            }
+        }
+
         try {
+            startForeground(NotificationHelper.NOTIFICATION_ID, notification, fgsTypes)
+        } catch (e: Exception) {
+            // Safe fallback to default if Android blocks location foreground service (e.g. restricted on boot)
+            logger.log(event = "FGS_FALLBACK", details = "Location FGS restricted (${e.javaClass.simpleName}); fallback to connectedDevice")
             startForeground(
                 NotificationHelper.NOTIFICATION_ID,
                 notification,
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
             )
-        } catch (e: SecurityException) {
-            logger.log(event = "SECURITY_EXCEPTION", details = e.message ?: "startForeground failed")
-            stopSelf()
         }
     }
 
-    private fun hasBluetoothConnectPermission(): Boolean {
-        return ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.BLUETOOTH_CONNECT
-            ) == PackageManager.PERMISSION_GRANTED
-    }
-
     private fun registerBluetoothReceiver() {
-        // Indicated which broadcasts shoudl be routed to this receiver
         val filter = IntentFilter().apply {
             addAction(BluetoothDevice.ACTION_ACL_CONNECTED)
             addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED)
