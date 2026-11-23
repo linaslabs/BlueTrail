@@ -10,11 +10,13 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -40,8 +42,12 @@ class MainActivity : ComponentActivity() {
                         logger = logger,
                         btHelper = btHelper,
                         locationHelper = locationHelper,
-                        onStartService = { startTrackingService() },
-                        onStopService = { stopTrackingService() },
+                        onStartService = { sendServiceAction(TrackingService.ACTION_START_SERVICE, isForegroundStart = true) },
+                        onStopService = { sendServiceAction(TrackingService.ACTION_STOP_SERVICE) },
+                        onStartPolicyTrail = { sendServiceAction(TrackingService.ACTION_START_POLICY_TRAIL, isForegroundStart = true) },
+                        onStopPolicyTrail = { sendServiceAction(TrackingService.ACTION_STOP_POLICY_TRAIL) },
+                        onPolicyChanged = { sendServiceAction(TrackingService.ACTION_APPLY_POLICY_CHANGE) },
+                        onLogChargeTick = { sendServiceAction(TrackingService.ACTION_TRIGGER_CHARGE_TICK) },
                         onMarkWithLabel = { tag -> sendTaggedMarkIntent(tag) },
                         onExportClick = {
                             val intent = logger.getExportIntent()
@@ -53,18 +59,15 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun startTrackingService() {
+    private fun sendServiceAction(actionStr: String, isForegroundStart: Boolean = false) {
         val intent = Intent(this, TrackingService::class.java).apply {
-            action = TrackingService.ACTION_START_SERVICE
+            action = actionStr
         }
-        ContextCompat.startForegroundService(this, intent)
-    }
-
-    private fun stopTrackingService() {
-        val intent = Intent(this, TrackingService::class.java).apply {
-            action = TrackingService.ACTION_STOP_SERVICE
+        if (isForegroundStart) {
+            ContextCompat.startForegroundService(this, intent)
+        } else {
+            startService(intent)
         }
-        startService(intent)
     }
 
     private fun sendTaggedMarkIntent(label: String) {
@@ -83,32 +86,22 @@ fun MainScreen(
     locationHelper: LocationHelper,
     onStartService: () -> Unit,
     onStopService: () -> Unit,
+    onStartPolicyTrail: () -> Unit,
+    onStopPolicyTrail: () -> Unit,
+    onPolicyChanged: () -> Unit,
+    onLogChargeTick: () -> Unit,
     onMarkWithLabel: (String) -> Unit,
     onExportClick: () -> Unit
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
     var logContent by remember { mutableStateOf(logger.readLog()) }
-    var testTagInput by remember { mutableStateOf("T18 indoor-disconnect") }
-    var isLocating by remember { mutableStateOf(false) }
-    var useHighAccuracy by remember { mutableStateOf(locationHelper.useHighAccuracy) }
+    var testTagInput by remember { mutableStateOf("T24-PolicyA-Start") }
+    var currentPolicy by remember { mutableStateOf(locationHelper.currentPolicy) }
 
-    fun fetchAndLogDevices() {
-        if (!btHelper.isBluetoothEnabled()) {
-            Toast.makeText(context, "Please turn on Bluetooth first", Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        val devices = btHelper.getPairedDevices()
-        if (devices.isEmpty()) {
-            logger.log(event = "PAIRED_QUERY", details = "No paired devices found")
-        } else {
-            devices.forEach { device ->
-                val details = "MAC: ${device.address}; ClassCode: ${device.classCodeHex} (${device.rawClassInt})"
-                logger.log(event = "PAIRED_DEVICE", device = device.name, details = details)
-            }
-        }
-        logContent = logger.readLog()
-    }
+    // Dialog state for selecting tracked devices
+    var showDeviceDialog by remember { mutableStateOf(false) }
+    var pairedDevices by remember { mutableStateOf<List<PairedDeviceInfo>>(emptyList()) }
+    var trackedCount by remember { mutableIntStateOf(btHelper.getTrackedAddresses().size) }
 
     val permissionsLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
@@ -121,9 +114,9 @@ fun MainScreen(
 
         if (btGranted && notifGranted && fineLocationGranted) {
             onStartService()
-            Toast.makeText(context, "All permissions granted. Service starting...", Toast.LENGTH_SHORT).show()
+            Toast.makeText(context, "Monitoring started", Toast.LENGTH_SHORT).show()
         } else {
-            Toast.makeText(context, "Bluetooth, Location and Notification permissions required", Toast.LENGTH_LONG).show()
+            Toast.makeText(context, "All permissions are required for background testing", Toast.LENGTH_LONG).show()
         }
     }
 
@@ -151,39 +144,61 @@ fun MainScreen(
         }
     }
 
-    fun testManualLocationFix() {
-        if (!locationHelper.hasLocationPermission()) {
-            Toast.makeText(context, "Please grant Location permission first via 'Start Monitor'", Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        isLocating = true
-        Toast.makeText(context, "Requesting fresh location fix...", Toast.LENGTH_SHORT).show()
-
-        locationHelper.captureFreshFix { result ->  
-            isLocating = false
-            if (result.latitude != null && result.longitude != null) {
-                logger.log(
-                    event = "MANUAL_FIX",
-                    device = "ScreenTest",
-                    details = "Mode: ${result.modeUsed}; Latency: ${result.fixLatencyMs}ms; Acc: ${result.accuracyMeters}m; LastKnownAge: ${result.lastKnownAgeSeconds}s",
-                    latitude = result.latitude,
-                    longitude = result.longitude,
-                    accuracyM = result.accuracyMeters,
-                    fixLatencyMs = result.fixLatencyMs,
-                    lastKnownAgeS = result.lastKnownAgeSeconds
-                )
-            } else {
-                logger.log(
-                    event = "MANUAL_FIX_FAILED",
-                    device = "ScreenTest",
-                    details = "Mode: ${result.modeUsed}; Reason: ${result.failureReason ?: "Unknown error"}; Latency: ${result.fixLatencyMs}ms; LastKnownAge: ${result.lastKnownAgeSeconds}s",
-                    fixLatencyMs = result.fixLatencyMs,
-                    lastKnownAgeS = result.lastKnownAgeSeconds
-                )
+    if (showDeviceDialog) {
+        AlertDialog(
+            onDismissRequest = { showDeviceDialog = false },
+            title = { Text("Select Tracked Devices") },
+            text = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .verticalScroll(rememberScrollState())
+                ) {
+                    if (pairedDevices.isEmpty()) {
+                        Text("No paired devices found. Turn Bluetooth ON and grant permissions.")
+                    } else {
+                        pairedDevices.forEach { device ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        val nowTracked = btHelper.toggleDeviceTracked(device.address)
+                                        pairedDevices = btHelper.getPairedDevices()
+                                        trackedCount = btHelper.getTrackedAddresses().size
+                                        logger.log(
+                                            event = "TRACK_TOGGLE",
+                                            device = device.name,
+                                            details = "MAC: ${device.address}; Tracked: $nowTracked"
+                                        )
+                                        logContent = logger.readLog()
+                                    }
+                                    .padding(vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Checkbox(
+                                    checked = device.isTracked,
+                                    onCheckedChange = null
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Column {
+                                    Text(text = device.name, style = MaterialTheme.typography.bodyMedium)
+                                    Text(
+                                        text = "${device.address} (${device.classCodeHex})",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showDeviceDialog = false }) {
+                    Text("Done")
+                }
             }
-            logContent = logger.readLog()
-        }
+        )
     }
 
     Column(
@@ -192,13 +207,13 @@ fun MainScreen(
             .padding(16.dp)
     ) {
         Text(
-            text = "BlueTrail - Test App (CP4 Location)",
+            text = "BlueTrail - Increment 3 (CP5)",
             style = MaterialTheme.typography.titleLarge
         )
 
-        Spacer(modifier = Modifier.height(10.dp))
+        Spacer(modifier = Modifier.height(8.dp))
 
-        // Service Controls
+        // Service Master Controls
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -222,70 +237,85 @@ fun MainScreen(
             }
         }
 
-        Spacer(modifier = Modifier.height(8.dp))
+        Spacer(modifier = Modifier.height(6.dp))
 
+        // Tracked Device Dialog Trigger (Leave at 0 selected during T24 battery runs!)
+        Button(
+            onClick = {
+                if (!btHelper.isBluetoothEnabled()) {
+                    Toast.makeText(context, "Turn on Bluetooth first", Toast.LENGTH_SHORT).show()
+                } else {
+                    pairedDevices = btHelper.getPairedDevices()
+                    showDeviceDialog = true
+                }
+            },
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("Select Tracked Devices ($trackedCount selected)")
+        }
+
+        Spacer(modifier = Modifier.height(6.dp))
+
+        // Policy Switcher and Trail Controls (Stage 1 T23/T24)
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
-            Button(
-                onClick = { fetchAndLogDevices() },
-                modifier = Modifier.weight(1f)
+            OutlinedButton(
+                onClick = {
+                    val next = currentPolicy.next()
+                    currentPolicy = next
+                    locationHelper.currentPolicy = next
+                    onPolicyChanged()
+                    logContent = logger.readLog()
+                },
+                modifier = Modifier.weight(1.3f)
             ) {
-                Text("List Paired")
+                Text(currentPolicy.displayName, fontSize = 11.sp)
             }
 
             Button(
                 onClick = {
-                    btHelper.checkAndLogConnectedDevices(logger, trigger = "MANUAL_CHECK")
+                    onStartPolicyTrail()
                     logContent = logger.readLog()
                 },
-                modifier = Modifier.weight(1f)
+                modifier = Modifier.weight(0.85f)
             ) {
-                Text("Check Connected")
-            }
-        }
-
-        Spacer(modifier = Modifier.height(8.dp))
-
-        // CP4 Controls: Manual Fix Button & T22 Mode Toggle
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            Button(
-                onClick = { testManualLocationFix() },
-                modifier = Modifier.weight(1f),
-                enabled = !isLocating
-            ) {
-                Text(if (isLocating) "Acquiring..." else "Test Fix")
+                Text("Start Trail", fontSize = 11.sp)
             }
 
             OutlinedButton(
                 onClick = {
-                    val newValue = !useHighAccuracy
-                    useHighAccuracy = newValue
-                    locationHelper.useHighAccuracy = newValue
-                    val modeName = if (newValue) "HIGH_ACCURACY" else "BALANCED_POWER"
-                    logger.log(
-                        event = "LOC_POLICY_CHANGED",
-                        device = "UserSetting",
-                        details = "Mode set to $modeName"
-                    )
+                    onStopPolicyTrail()
                     logContent = logger.readLog()
                 },
-                modifier = Modifier.weight(1f)
+                modifier = Modifier.weight(0.85f)
             ) {
-                Text(if (useHighAccuracy) "Mode: High Acc" else "Mode: Balanced")
+                Text("Stop Trail", fontSize = 11.sp)
             }
         }
 
-        Spacer(modifier = Modifier.height(8.dp))
+        Spacer(modifier = Modifier.height(6.dp))
+
+        // On-demand Fuel Gauge Checkpoint Button for T24
+        Button(
+            onClick = {
+                onLogChargeTick()
+                Toast.makeText(context, "Fuel gauge checkpoint logged", Toast.LENGTH_SHORT).show()
+                logContent = logger.readLog()
+            },
+            modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary)
+        ) {
+            Text("Log Charge Checkpoint (µAh)")
+        }
+
+        Spacer(modifier = Modifier.height(6.dp))
 
         OutlinedTextField(
             value = testTagInput,
             onValueChange = { testTagInput = it },
-            label = { Text("Scenario Tag (e.g. T18 indoors / T19 outdoors)") },
+            label = { Text("Scenario Tag (e.g. T24-PolicyA-Start)") },
             modifier = Modifier.fillMaxWidth(),
             singleLine = true
         )
@@ -303,18 +333,18 @@ fun MainScreen(
                 },
                 modifier = Modifier.weight(1f)
             ) {
-                Text("Mark ($testTagInput)")
+                Text("Mark ($testTagInput)", fontSize = 11.sp)
             }
 
             Button(
                 onClick = onExportClick,
                 modifier = Modifier.weight(1f)
             ) {
-                Text("Export CSV")
+                Text("Export CSV", fontSize = 11.sp)
             }
         }
 
-        Spacer(modifier = Modifier.height(8.dp))
+        Spacer(modifier = Modifier.height(6.dp))
 
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -338,14 +368,14 @@ fun MainScreen(
             }
         }
 
-        Spacer(modifier = Modifier.height(12.dp))
+        Spacer(modifier = Modifier.height(8.dp))
 
         Text(
             text = "Log Output (bluetrail_log.csv):",
             style = MaterialTheme.typography.labelLarge
         )
 
-        Spacer(modifier = Modifier.height(6.dp))
+        Spacer(modifier = Modifier.height(4.dp))
 
         Surface(
             modifier = Modifier

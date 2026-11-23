@@ -11,7 +11,8 @@ data class PairedDeviceInfo(
     val name: String,
     val address: String,
     val classCodeHex: String,
-    val rawClassInt: Int
+    val rawClassInt: Int,
+    val isTracked: Boolean = false
 )
 
 class BluetoothHelper(private val context: Context) {
@@ -19,8 +20,35 @@ class BluetoothHelper(private val context: Context) {
     private val bluetoothManager: BluetoothManager =
         context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
     private val bluetoothAdapter: BluetoothAdapter? = bluetoothManager.adapter
+    private val prefs = context.getSharedPreferences("bluetrail_prefs", Context.MODE_PRIVATE)
+
+    companion object {
+        private const val KEY_TRACKED_MACS = "tracked_device_macs"
+    }
 
     fun isBluetoothEnabled(): Boolean = bluetoothAdapter?.isEnabled == true
+
+    // Addresses of devices being tracked are part of the users preferences
+    fun getTrackedAddresses(): Set<String> {
+        return prefs.getStringSet(KEY_TRACKED_MACS, emptySet()) ?: emptySet()
+    }
+
+    fun isDeviceTracked(address: String): Boolean {
+        return getTrackedAddresses().contains(address)
+    }
+
+    fun toggleDeviceTracked(address: String): Boolean {
+        val current = getTrackedAddresses().toMutableSet()
+        val nowTracked = if (current.contains(address)) {
+            current.remove(address)
+            false
+        } else {
+            current.add(address)
+            true
+        }
+        prefs.edit().putStringSet(KEY_TRACKED_MACS, current).apply()
+        return nowTracked
+    }
 
     /**
      * Queries all paired (bonded) devices on the phone
@@ -28,17 +56,20 @@ class BluetoothHelper(private val context: Context) {
     @SuppressLint("MissingPermission")
     fun getPairedDevices(): List<PairedDeviceInfo> {
         val bonded = bluetoothAdapter?.bondedDevices ?: emptySet()
+        val trackedMacs = getTrackedAddresses()
 
         return bonded.map { device ->
             val deviceClass = device.bluetoothClass
             val classCodeInt = deviceClass?.deviceClass ?: 0
             val classCodeHex = "0x" + Integer.toHexString(classCodeInt).uppercase()
+            val address = device.address ?: "00:00:00:00:00:00"
 
             PairedDeviceInfo(
                 name = device.name ?: "Unknown Device",
-                address = device.address ?: "00:00:00:00:00:00",
+                address = address,
                 classCodeHex = classCodeHex,
-                rawClassInt = classCodeInt
+                rawClassInt = classCodeInt,
+                isTracked = trackedMacs.contains(address)
             )
         }
     }
@@ -80,7 +111,7 @@ class BluetoothHelper(private val context: Context) {
                     logger.log(
                         event = "CONNECTED_NOW",
                         device = device.name ?: "Unknown",
-                        details = "Trigger: $trigger; MAC: ${device.address}"
+                        details = "Trigger: $trigger; MAC: ${device.address}; Tracked: ${isDeviceTracked(device.address)}"
                     )
                 }
             }
@@ -99,7 +130,7 @@ class BluetoothHelper(private val context: Context) {
                                 logger.log(
                                     event = "CONNECTED_NOW",
                                     device = device.name ?: "Unknown",
-                                    details = "Trigger: $trigger; MAC: ${device.address}"
+                                    details = "Trigger: $trigger; MAC: ${device.address}; Tracked: ${isDeviceTracked(device.address)}"
                                 )
                             }
                         }
